@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+logs/
+*.backup
+*.before-live-price
+*.before-live-cache
+*.before-live-change
+*.before-batch-ltp

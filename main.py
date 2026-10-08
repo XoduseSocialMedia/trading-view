@@ -55,10 +55,12 @@ if "matplotlib" in _SCRIPT_EXTRA_LIBS:
 # since it was added), the app must keep working exactly as before on
 # yfinance — so this import is allowed to fail silently.
 try:
-    from SmartApi import SmartConnect
-    import pyotp
-    _ANGEL_SDK_AVAILABLE = True
-except ImportError:
+    import importlib.util
+    _ANGEL_SDK_AVAILABLE = (
+        importlib.util.find_spec("SmartApi") is not None
+        and importlib.util.find_spec("pyotp") is not None
+    )
+except Exception:
     _ANGEL_SDK_AVAILABLE = False
 
 load_dotenv()  # reads SUPABASE_URL / SUPABASE_KEY / ANGEL_* from .env in this folder
@@ -539,6 +541,9 @@ def get_angel_session(force_new: bool = False):
 
     _angel_session["last_login_attempt"] = now
     try:
+        from SmartApi import SmartConnect
+        import pyotp
+
         obj = SmartConnect(api_key=ANGEL_API_KEY)
         totp = pyotp.TOTP(ANGEL_TOTP_SECRET).now()
         session = obj.generateSession(ANGEL_CLIENT_ID, ANGEL_PASSWORD, totp)
@@ -910,6 +915,268 @@ def get_candles(request: Request, symbol: str = Query(...), timeframe: str = Que
             "open": latest["open"],
         }
     }
+
+
+def _batch_yfinance_live_prices(symbols):
+    result = {}
+
+    if not symbols:
+        return result
+
+    try:
+        df = yf.download(
+            tickers=symbols,
+            period="5d",
+            interval="1d",
+            auto_adjust=True,
+            prepost=False,
+            progress=False,
+            threads=True,
+            group_by="ticker",
+        )
+
+        if df is None or df.empty:
+            return result
+
+        for symbol in symbols:
+            try:
+                if len(symbols) == 1:
+                    close_series = df["Close"].dropna()
+                else:
+                    if symbol not in df.columns.get_level_values(0):
+                        continue
+                    close_series = df[symbol]["Close"].dropna()
+
+                if close_series.empty:
+                    continue
+
+                price = float(close_series.iloc[-1])
+                prev = float(close_series.iloc[-2]) if len(close_series) > 1 else price
+
+                change = price - prev
+                change_pct = (change / prev) * 100 if prev else 0
+
+                if price < 0.0001:
+                    price_out = round(price, 10)
+                    change_out = round(change, 10)
+                elif price < 0.01:
+                    price_out = round(price, 8)
+                    change_out = round(change, 8)
+                elif price < 1:
+                    price_out = round(price, 6)
+                    change_out = round(change, 6)
+                else:
+                    price_out = round(price, 4)
+                    change_out = round(change, 4)
+
+                result[symbol] = {
+                    "price": price_out,
+                    "change": change_out,
+                    "change_pct": round(change_pct, 2),
+                    "source": "yfinance_batch",
+                }
+
+            except Exception as e:
+                print(f"[batch yfinance parse fail] {symbol}: {str(e)[:100]}")
+
+    except Exception as e:
+        print(f"[batch yfinance fail] {str(e)[:200]}")
+
+    # ---------------------------------------------------------
+    # 2B. CRYPTO FALLBACK — COINGECKO
+    # Yahoo Finance may not provide some crypto symbols.
+    # ---------------------------------------------------------
+    crypto_ids = {
+        "UNI-USD": "uniswap",
+        "SHIB-USD": "shiba-inu",
+    }
+
+    missing_crypto = [
+        symbol for symbol in crypto_ids
+        if symbol in symbols and symbol not in result
+    ]
+
+    if missing_crypto:
+        try:
+            import urllib.parse
+            import urllib.request
+
+            ids = ",".join(crypto_ids[s] for s in missing_crypto)
+            url = (
+                "https://api.coingecko.com/api/v3/simple/price?"
+                + urllib.parse.urlencode({
+                    "ids": ids,
+                    "vs_currencies": "usd",
+                    "include_24hr_change": "true"
+                })
+            )
+
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "FinxView/1.0"}
+            )
+
+            with urllib.request.urlopen(req, timeout=8) as response:
+                data = json.loads(response.read().decode("utf-8"))
+
+            for symbol in missing_crypto:
+                coin_id = crypto_ids[symbol]
+                item = data.get(coin_id, {})
+                price = float(item.get("usd") or 0)
+                change_pct = float(item.get("usd_24h_change") or 0)
+
+                if price <= 0:
+                    continue
+
+                if price < 0.0001:
+                    price_out = round(price, 10)
+                elif price < 0.01:
+                    price_out = round(price, 8)
+                elif price < 1:
+                    price_out = round(price, 6)
+                else:
+                    price_out = round(price, 4)
+
+                change = price * change_pct / 100
+
+                result[symbol] = {
+                    "price": price_out,
+                    "change": round(change, 10 if price < 0.0001 else 6),
+                    "change_pct": round(change_pct, 2),
+                    "source": "coingecko",
+                }
+
+        except Exception as e:
+            print(f"[crypto fallback fail] {str(e)[:200]}")
+
+
+    return result
+
+
+_live_prices_cache = None
+_live_prices_cache_time = 0.0
+LIVE_PRICES_CACHE_TTL = 10
+
+@app.get("/api/live-prices")
+def get_live_prices():
+    """
+    Fast sidebar live-price endpoint.
+
+    NSE stocks:
+        Angel One batch LTP.
+
+    Other markets:
+        One batched yfinance request instead of one request per symbol.
+    """
+    global _live_prices_cache, _live_prices_cache_time
+
+    now = time.time()
+
+    if (
+        _live_prices_cache is not None
+        and now - _live_prices_cache_time < LIVE_PRICES_CACHE_TTL
+    ):
+        return _live_prices_cache
+
+    result = {}
+
+    # ---------------------------------------------------------
+    # 1. ANGEL ONE — BATCH LTP FOR NSE EQUITIES
+    # ---------------------------------------------------------
+    try:
+        if angelone_configured():
+            angel = get_angel_session()
+
+            if angel:
+                nse_tokens = {}
+                token_to_symbol = {}
+
+                for symbol, info in SYMBOLS.items():
+                    try:
+                        if info.get("category") in ANGEL_ELIGIBLE_CATEGORIES:
+                            base = symbol[:-3] if symbol.endswith(".NS") else symbol
+                            token = get_angel_token(base)
+
+                            if token:
+                                token = str(token)
+                                nse_tokens[symbol] = token
+                                token_to_symbol[token] = symbol
+
+                    except Exception as e:
+                        print(f"[live-price token fail] {symbol}: {str(e)[:100]}")
+
+                if nse_tokens:
+                    items = list(nse_tokens.items())
+
+                    # Angel One supports limited tokens per request.
+                    # Split NSE symbols into batches of 20.
+                    for i in range(0, len(items), 20):
+                        batch = items[i:i + 20]
+
+                        batch_symbols = {symbol: token for symbol, token in batch}
+                        batch_token_to_symbol = {
+                            str(token): symbol
+                            for symbol, token in batch
+                        }
+
+                        try:
+                            response = angel.getMarketData(
+                                "FULL",
+                                {"NSE": list(batch_symbols.values())}
+                            )
+
+                            if response and response.get("status"):
+                                fetched = response.get("data", {}).get("fetched", [])
+
+                                for item in fetched:
+                                    symbol = batch_token_to_symbol.get(
+                                        str(item.get("symbolToken"))
+                                    )
+
+                                    if not symbol:
+                                        continue
+
+                                    price = float(item.get("ltp") or 0)
+
+                                    if price <= 0:
+                                        continue
+
+                                    result[symbol] = {
+                                        "price": round(price, 4),
+                                        "change": round(float(item.get("netChange") or 0), 4),
+                                        "change_pct": round(float(item.get("percentChange") or 0), 2),
+                                        "source": "angelone_ltp",
+                                    }
+
+                        except Exception as batch_error:
+                            print(
+                                f"[live-price AngelOne batch fail] "
+                                f"{i // 20 + 1}: {str(batch_error)[:150]}"
+                            )
+
+    except Exception as e:
+        print(f"[live-price AngelOne batch fail] {str(e)[:200]}")
+
+    # ---------------------------------------------------------
+    # 2. YFINANCE — ONE BATCH REQUEST FOR ALL OTHER SYMBOLS
+    # ---------------------------------------------------------
+    remaining = [
+        symbol
+        for symbol in SYMBOLS
+        if symbol not in result
+    ]
+
+    result.update(_batch_yfinance_live_prices(remaining))
+
+    response_data = {
+        "prices": result,
+        "timestamp": time.time()
+    }
+
+    _live_prices_cache = response_data
+    _live_prices_cache_time = time.time()
+
+    return response_data
 
 
 @app.get("/api/indicators/sma")

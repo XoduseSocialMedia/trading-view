@@ -2967,59 +2967,33 @@ async function loadSymbols() {
 // ============================================================
 let _sidebarPriceRefreshInFlight = false;
 async function loadAllSidebarPrices() {
-  // Critical guard: without this, a cycle that takes longer than the 60s
-  // interval below (which it reliably did — refreshing every symbol in
-  // every sidebar category, including ones scrolled out of view, easily
-  // took 60-90+ seconds once Angel One started rate-limiting) meant the
-  // NEXT scheduled tick started a SECOND overlapping cycle on top of the
-  // first, which was still mid-flight. Those compounded indefinitely —
-  // each new tick adding another full wave of requests to an already
-  // growing backlog — until the backend had hundreds of overlapping
-  // in-flight requests and stopped responding to anything at all. This
-  // guard makes an overrunning cycle skip the next tick instead of
-  // stacking a new one on top of it — self-correcting regardless of how
-  // long any given cycle actually takes.
   if (_sidebarPriceRefreshInFlight) return;
+
   _sidebarPriceRefreshInFlight = true;
+
   try {
-    const allSyms = Object.values(allSymbolData).flat();
-    // Smaller batches, longer pause: Angel One was the one actively
-    // rejecting requests ("exceeding access rate") under the old
-    // BATCH=5/200ms pacing — this refresh is just for sidebar ticker
-    // prices, not something that needs to race the main chart's own
-    // fetches, so easing off here costs nothing but a slightly slower
-    // full sweep of the sidebar.
-    const BATCH = 3;
-    for (let i = 0; i < allSyms.length; i += BATCH) {
-      const batch = allSyms.slice(i, i + BATCH);
-      await Promise.all(batch.map(async (s) => {
-        try {
-          // Try browser-side Yahoo Finance first (real live price)
-          const candles = await fetchRealDataFromBrowser(s.symbol, '1D');
-          if (candles && candles.length > 1) {
-            const last = candles[candles.length - 1];
-            const prev = candles[candles.length - 2] || last;
-            const change = last.close - prev.close;
-            const change_pct = (change / prev.close) * 100;
-            updateSidebarPrice(s.symbol, last.close, change, change_pct);
-            return;
-          }
-        } catch(e) {}
-        // Fallback: hit backend API
-        try {
-          const r = await fetch(`/api/candles?symbol=${encodeURIComponent(s.symbol)}&timeframe=1D`);
-          if (!r.ok) return;
-          const data = await r.json();
-          if (data.latest) {
-            updateSidebarPrice(s.symbol, data.latest.price, data.latest.change, data.latest.change_pct);
-          }
-        } catch(e) {}
-      }));
-      // Small pause between batches to keep browser responsive, and —
-      // more importantly now — to keep this from bursting requests at
-      // Angel One faster than its own rate limit tolerates.
-      await new Promise(res => setTimeout(res, 350));
-    }
+    const r = await fetch('/api/live-prices', {
+      cache: 'no-store'
+    });
+
+    if (!r.ok) return;
+
+    const data = await r.json();
+    const prices = data.prices || {};
+
+    Object.entries(prices).forEach(([symbol, item]) => {
+      if (!item || !item.price) return;
+
+      updateSidebarPrice(
+        symbol,
+        item.price,
+        item.change || 0,
+        item.change_pct || 0
+      );
+    });
+
+  } catch (e) {
+    console.error('[sidebar live prices]', e);
   } finally {
     _sidebarPriceRefreshInFlight = false;
   }
@@ -3040,10 +3014,10 @@ function updateSidebarPrice(sym, price, change, change_pct) {
   }
 }
 
-// Refresh sidebar prices every 60 seconds
+// Refresh sidebar prices every 15 seconds
 setInterval(() => {
   if (Object.keys(allSymbolData).length > 0) loadAllSidebarPrices();
-}, 60000);
+}, 15000);
 
 function cleanCode(sym) {
   return sym.replace('.NS','').replace('.BO','').replace('=X','').replace('=F','').replace('-USD','/USD').replace('^','');
@@ -4081,13 +4055,29 @@ async function buildWatchlist() {
 }
 
 async function loadWatchlistPrices() {
-  for (const sym of WATCHLIST) {
-    try {
-      const r = await fetch(`/api/candles?symbol=${encodeURIComponent(sym)}&timeframe=1D`);
-      if (!r.ok) continue;
-      const data = await r.json();
-      updateWatchlistPrice(sym, data.latest);
-    } catch(e) {}
+  try {
+    const r = await fetch('/api/live-prices', {
+      cache: 'no-store'
+    });
+
+    if (!r.ok) return;
+
+    const data = await r.json();
+    const prices = data.prices || {};
+
+    WATCHLIST.forEach(sym => {
+      const item = prices[sym];
+      if (!item || !item.price) return;
+
+      updateWatchlistPrice(sym, {
+        price: item.price,
+        change: item.change || 0,
+        change_pct: item.change_pct || 0
+      });
+    });
+
+  } catch (e) {
+    console.error('[watchlist live prices]', e);
   }
 }
 
